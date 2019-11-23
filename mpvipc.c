@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -9,13 +10,16 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/time.h>
-#include <sys/select.h>
+#include <poll.h>
 
 #define BUFSIZE 10240
 // S(x) expands x as string
 #define _S(x) #x
 #define S(x) _S(x)
+
+
+// number of file descriptors we need to poll
+int num_fds = 0;
 
 
 //
@@ -34,15 +38,12 @@ void debug(const char *format, ...)
   va_end(args);
 }
 
-
-int    max_fd = 0;   // max file descriptor we have seen
-fd_set empty_fd_set; // to be initialized to 'zero' in main
-// select helper - check if the given file descriptor set is empty
-int FD_IS_EMPTY(fd_set* fdset) {
-  return memcmp(fdset, &empty_fd_set, sizeof(fd_set)) == 0;
+// check if a bit is set, return 1 if so, else 0
+int bit(short event, unsigned short mask) {
+  return event & mask? 1:0;
 }
 
-// socket helper - returns fd for given path
+// unix domain socket helper - returns fd for given path
 int open_fd(char* path)
 {
   int fd;
@@ -95,8 +96,7 @@ struct client *clist = NULL;
 // add a descriptor to linked list
 void clist_add_fd(int fd) {
 
-  struct client *cl      = clist;
-  struct client *cl_prev = cl;
+  struct client *cl = clist, *cl_prev = cl;
 
   // check if fd is already part of the list
   while(cl) {
@@ -120,48 +120,30 @@ void clist_add_fd(int fd) {
     // clist was empty - first element
     clist = cl;
 
-  // update max fd we have seen
-  max_fd = max_fd > fd ? max_fd : fd;
   return;
 }
 
-// return pointer to client struct for given fd, or NULL
-struct client* clist_find_cl(int fd){
-
-  struct client *cl = clist;
-  while(cl) {
-    if(cl->fd == fd)
-      return cl;
-    cl = cl->next;
-  }
-  return NULL;
-}
-
-// print data of entire list
+// print data of clist array
 void clist_print_all() {
 
   struct client *cl = clist;
-  while(cl) {
+  for(int i=0; i<num_fds; i++, cl++) {
     if(cl->title[0])
       printf("%s", cl->title);
     if(cl->response[0])
       printf("%s", cl->response);
-    cl = cl->next;
   }
 }
 
 // close all file descriptors we have got
 void clist_close_all() {
 
-  struct client *cl = clist, *cl_tmp;
-  while(cl) {
+  struct client *cl = clist;
+  for(int i=0; i<num_fds; i++, cl++) {
     if(cl->fd) {
       debug("fd %2d - close :\n", cl->fd);
       close(cl->fd);
     }
-    cl_tmp = cl->next;
-    free(cl);
-    cl = cl_tmp;
   }
 }
 
@@ -169,74 +151,77 @@ void clist_close_all() {
 // responses
 void clist_get_response(char* cmd, reqtype_t rtype) {
 
-  int  retval = 0, read_empty = 0, write_empty = 0;
+  int  retval = 0, num_finished = 0, fd;
   ssize_t nread = 0, nwritten = 0;
+  short events;
+  unsigned short poll_read = POLLIN, poll_write = POLLOUT;
+  unsigned short poll_all = POLLIN | POLLPRI | POLLOUT
+    | POLLRDNORM | POLLRDBAND 
+    | POLLMSG | POLLREMOVE | POLLRDHUP;
   char buf[BUFSIZE+1];
   struct client *cl = clist;
-  struct timeval tv, tv_default;
-  fd_set active_read_fd_set, read_fd_set, active_write_fd_set, write_fd_set;
-  fd_set *read_fd_set_ptr, *write_fd_set_ptr;
 
   // obviously, if clist is empty we got nothing to do
   if(!cl) return;
 
-  // select timeout, half second
-  tv_default.tv_sec  = 1;
-  tv_default.tv_usec = 0;
+  // array of polling structures
+  struct pollfd *fds = calloc(num_fds, sizeof(struct pollfd)), *fds_tmp = fds;
 
-  FD_ZERO (&active_read_fd_set);
-  FD_ZERO (&active_write_fd_set);
+  // initialize fd's and event flags
+  for(int i=0; i<num_fds; i++, fds_tmp++) {
 
-  // walk through list and as fd's to read/write sets for select
-  while(cl) {
-    FD_SET (cl->fd, &active_read_fd_set);
-    FD_SET (cl->fd, &active_write_fd_set);
-    cl = cl->next;
+    fds_tmp->fd = (clist+i)->fd;
+
+    if(debug_flag)
+      // let's see what else might be going on in debug mode
+      fds_tmp->events = poll_all;
+    else if(strstr(cmd, "\"command\""))
+      // json, need to read response
+      fds_tmp->events = poll_read | poll_write;
+    else
+      // plain command, there won't be a response
+     fds_tmp->events = poll_write;
   }
 
-  // only when sending commands in JSON format we need to read a response
-  if(!strstr(cmd, "\"command\"")) FD_ZERO (&active_read_fd_set);
-  read_empty  = FD_IS_EMPTY(&active_read_fd_set);
-  write_empty = FD_IS_EMPTY(&active_write_fd_set);
+  // main polling loop - keep goind til we have seen 1 read/write each on all
+  // fd's
+  while(num_finished < num_fds) {
 
-  // we remove read/write fd's from active sets as we go along - quit loop when
-  // both are empty
-  while(!(read_empty && write_empty)) {
-
-    if(read_empty)
-      read_fd_set_ptr = NULL;
-    else {
-      memcpy(&read_fd_set, &active_read_fd_set, sizeof(fd_set));
-      read_fd_set_ptr = &read_fd_set;
-    }
-
-    if(write_empty)
-      write_fd_set_ptr = NULL;
-    else {
-      memcpy(&write_fd_set, &active_write_fd_set, sizeof(fd_set));
-      write_fd_set_ptr = &write_fd_set;
-    }
-
-    // note: select might modify tv
-    memcpy(&tv, &tv_default, sizeof(struct timeval));
-    retval = select(max_fd + 1, read_fd_set_ptr, write_fd_set_ptr, NULL, &tv);
-    debug("time          : %ld.%03ld\n", (long) tv.tv_sec, (long) tv.tv_usec/1000);
-
+    // 1 second timeout
+    retval = poll(fds, (nfds_t) num_fds, 1000);
     if (retval < 0) {
-      debug("select error: %s\n", strerror(errno));
+      debug("poll error  : %s\n", strerror(errno));
       return;
     }
     else if (retval == 0) {
-      debug("select timeout\n");
+      debug("poll timeout\n");
       return;
     }
 
-    // now iterate over the whole [0, max_fd] range and see if an fd is
-    // readable and/or writable
-    for (int fd = 0; fd <= max_fd; ++fd) {
+    // now iterate over the [0, num_fds] range and see if an fd is readable
+    // and/or writable
+    fds_tmp = fds;
+    for (int i = 0; i < num_fds; i++, fds_tmp++) {
+
+      fd = fds_tmp->fd;
+      // already done on this fd
+      if(fd == -1) continue;
+
+      events = fds_tmp->revents;
+      if(events != 0)
+        debug("fd %2d revents :%d %d %d %d %d %d %d %d\n",
+              fd,
+              bit(events, POLLIN),
+              bit(events, POLLPRI),
+              bit(events, POLLOUT),
+              bit(events, POLLRDNORM),
+              bit(events, POLLRDBAND),
+              bit(events, POLLMSG),
+              bit(events, POLLREMOVE),
+              bit(events, POLLRDHUP));
 
       // check if writable
-      if (!write_empty && FD_ISSET (fd, &write_fd_set)) {
+      if (fds_tmp->revents & poll_write) {
 
         snprintf(buf, BUFSIZE, "%s\n", cmd);
         debug("fd %2d - write : %s", fd, buf);
@@ -247,54 +232,59 @@ void clist_get_response(char* cmd, reqtype_t rtype) {
             debug("write error : %s\n", strerror(errno));
           else
             debug("write error : 0 written - %s\n", strerror(errno));
-          FD_CLR (fd, &active_write_fd_set);
           continue;
         }
 
-        // delete fd from write set
-        FD_CLR (fd, &active_write_fd_set);
+        // done polling for writes on this fd
+        fds_tmp->events &= ~poll_write;
       }
 
       // check if readable
-      if (!read_empty && FD_ISSET (fd, &read_fd_set)) {
+      if (fds_tmp->revents & poll_read) {
 
         nread = read(fd,buf,BUFSIZE);
         if(nread <= 0) {
           if(nread < 0)
             debug("read error  : %s\n", strerror(errno));
           else
+            // eof
             debug("read error  : 0 read - %s\n", strerror(errno));
-          FD_CLR (fd, &active_read_fd_set);
+          // done polling for reads on this fd
+          fds_tmp->events &= ~poll_read;
           continue;
         }
+
         buf[nread] = '\0';
         debug("fd %2d - read  : %s", fd, buf);
 
         // only response lines matching this are valid for us
         if(strstr(buf, ",\"error\":\"")) {
 
-          // find client data in linked list for given fd
-          cl = clist_find_cl(fd);
-          if (cl) {
-            // store response according to request type
-            if(rtype == title) {
-              sscanf(buf, "%" S(BUFSIZE) "c", cl->title);
-            }
-            else {
-              sscanf(buf, "%" S(BUFSIZE) "c", cl->response);
-            }
+          // client struct for given fd
+          cl = clist + i;
+          // store response according to request type
+          if(rtype == title) {
+            sscanf(buf, "%" S(BUFSIZE) "c", cl->title);
           }
-          // since the response was valid delete fd from read list
-          FD_CLR (fd, &active_read_fd_set);
+          else {
+            sscanf(buf, "%" S(BUFSIZE) "c", cl->response);
+          }
+
+          // done polling for reads on this fd
+          fds_tmp->events &= ~poll_read;
         }
       }
+
+      // if an fd has seen both, one read and one write, it doesn't need any
+      // more polling
+      if( (fds_tmp->events & (poll_read|poll_write)) == 0) {
+        fds_tmp->fd = -1;
+        num_finished++;
+      }
     } // end for loop
-
-    // update empty statuses after FD_CLR calls and before next while iteration
-    write_empty = write_empty || FD_IS_EMPTY(&active_write_fd_set);
-    read_empty  = read_empty  || FD_IS_EMPTY(&active_read_fd_set);
-
   } // end while loop
+
+  free(fds);
 }
 
 
@@ -402,7 +392,10 @@ int main (int argc, char **argv)
         if(strcmp(include, ep->d_name) == 0) {
           // get file descriptor and add it to linked list
           fd = open_fd(buf);
-          if (fd) clist_add_fd(fd);
+          if (fd) {
+            clist_add_fd(fd);
+            num_fds++;
+          }
           debug("fd %2d - path  : %s\n", fd, buf);
           // done - we want just this one entry
           break;
@@ -411,15 +404,18 @@ int main (int argc, char **argv)
       }
 
       fd = open_fd(buf);
-      if (fd) clist_add_fd(fd);
+      if (fd) {
+        clist_add_fd(fd);
+        num_fds++;
+      }
       debug("fd %2d - path  : %s\n", fd, buf);
     }
 
-    // directory traversal finished, linked list complete
+    // directory listing finished, linked list complete
     (void) closedir(dp);
   }
   else {
-    debug("directory traversal error: %s\n", strerror(errno));
+    debug("directory listing error: %s\n", strerror(errno));
     exit(1);
   }
 
@@ -428,10 +424,15 @@ int main (int argc, char **argv)
     exit(0);
   }
 
-
-  // initialize this global before calls to clist_get_response; we need it to
-  // recognize if an fd_set is empty
-  FD_ZERO(&empty_fd_set);
+  // turn linked list into array, for easier use
+  struct client *cl_arr = malloc(num_fds * sizeof(struct client)), *cl_ptr = cl_arr, *cl_tmp = NULL;
+  while(clist) {
+    memcpy(cl_ptr++, clist, sizeof(struct client));
+    cl_tmp = clist;
+    clist = clist->next;
+    free(cl_tmp);
+  }
+  clist = cl_arr;
 
   // optionally get titles
   if(verbose) clist_get_response("{ \"command\": [\"get_property\", \"media-title\"] }", title);
@@ -444,6 +445,7 @@ int main (int argc, char **argv)
   }
 
   clist_close_all();
+  free(clist);
 
   exit (0);
 }
