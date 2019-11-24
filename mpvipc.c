@@ -297,8 +297,7 @@ int main (int argc, char **argv)
   // command line option parsing
   int   c       = 0;
   int   verbose = 0;
-  char* exclude = NULL;
-  char* include = NULL;
+  char* exclude = NULL, *include = NULL, *path = NULL, *home = NULL;
 
   while (1) {
     static struct option long_options[] =
@@ -312,6 +311,8 @@ int main (int argc, char **argv)
        {"exclude", required_argument, 0, 'e'},
        // operate only on this socket
        {"include", required_argument, 0, 'i'},
+       // path to socket dir - can be absolute or relative to HOME
+       {"path",    required_argument, 0, 'p'},
        // print responses
        {"verbose", no_argument,       0, 'v'},
        {0, 0, 0, 0}
@@ -319,7 +320,7 @@ int main (int argc, char **argv)
     /* getopt_long stores the option index here. */
     int option_index = 0;
 
-    c = getopt_long (argc, argv, "de:i:v", long_options, &option_index);
+    c = getopt_long (argc, argv, "de:i:vp:", long_options, &option_index);
 
     /* Detect the end of the options. */
     if (c == -1) break;
@@ -335,6 +336,9 @@ int main (int argc, char **argv)
     case 'i':
       // i means: we perform command only on this socket
       include = optarg;
+      break;
+    case 'p':
+      path = optarg;
       break;
     case 'v':
       // print responses
@@ -352,22 +356,47 @@ int main (int argc, char **argv)
   if(verbose)    debug("verbose       : enabled\n");
   if(exclude)    debug("exclude       : %s\n", exclude);
   if(include)    debug("include       : %s\n", include);
+  if(path)       debug("path          : %s\n", path);
 
   // after option parsing, there should be the actual mpv command
   if (optind >= argc) {
-    debug("No command given, exiting.\n");
-    exit(0);
+    fprintf(stderr, "No command given, exiting.\n");
+    exit(1);
   }
 
   // socket directory
-  char* dir = "/home/ghermann/.config/mpv/socket";
+  char *dir = NULL;
+  // stat
+  struct stat sb;
+
+  home = getenv("HOME");
+  // the default I use in my home dir
+  if(!path) path = ".config/mpv/socket";
+
+  if(path[0] != '/' && !home) {
+    fprintf(stderr, "socket directory path relative and HOME not set: %s\n", path);
+    fprintf(stderr, "exiting.\n");
+    exit(1);
+  }
+  else if(path[0] == '/')
+    dir = path;
+  else {
+    int len = strlen(home) + strlen(path) + 2;
+    dir = malloc(len);
+    snprintf(dir, len, "%s/%s", home, path);
+  }
+  if ( (stat(dir, &sb) == -1) || ((sb.st_mode & S_IFMT) != S_IFDIR)) {
+    fprintf(stderr, "socket directory doesn't exist: %s\n", dir);
+    fprintf(stderr, "exiting.\n");
+    exit(1);
+  }
+  debug("socket dir    : %s\n", dir);
+
   int   fd;
   char  buf[BUFSIZE+1];
-  // directory traversal
+  // directory listing
   DIR*  dp;
   struct dirent *ep;
-  // stat
-  struct stat    sb;
 
   // now go over socket directory entries and construct linked list
   dp = opendir(dir);
@@ -382,14 +411,15 @@ int main (int argc, char **argv)
       if ( (stat(buf, &sb) == -1) || ((sb.st_mode & S_IFMT) != S_IFSOCK))
         continue;
 
-      // skip if this pid excluded
-      if (exclude && (strcmp(exclude, ep->d_name) == 0))
+      // skip if this socket is excluded; can be basename or full path
+      if (exclude &&
+          ((strcmp(exclude, ep->d_name) == 0) || (strcmp(exclude, buf) == 0)))
         continue;
 
-        // if include is set that's all we want
+      // if include is set that's the only (!) socket we want
       if(include) {
 
-        if(strcmp(include, ep->d_name) == 0) {
+        if ((strcmp(include, ep->d_name) == 0) || (strcmp(include, buf) == 0)) {
           // get file descriptor and add it to linked list
           fd = open_fd(buf);
           if (fd) {
@@ -397,12 +427,14 @@ int main (int argc, char **argv)
             num_fds++;
           }
           debug("fd %2d - path  : %s\n", fd, buf);
-          // done - we want just this one entry
+          // done
           break;
         }
         continue;
       }
 
+      // we get here only when include isn't set, and when this path is not
+      // excluded
       fd = open_fd(buf);
       if (fd) {
         clist_add_fd(fd);
@@ -415,16 +447,21 @@ int main (int argc, char **argv)
     (void) closedir(dp);
   }
   else {
-    debug("directory listing error: %s\n", strerror(errno));
+    fprintf(stderr, "directory listing error: %s\n", strerror(errno));
+    fprintf(stderr, "for directory: %s\nexiting.\n", dir);
     exit(1);
   }
+  if(dir && dir != path) free(dir);
 
   if(!clist) {
-    debug("fd set emtpy, exiting.\n");
+    fprintf(stderr, "socket set emtpy, exiting.\n");
     exit(0);
   }
 
-  // turn linked list into array, for easier use
+  // turn linked list into array, for easier use; not strictly necessary, but
+  // this way we don't need to advance two structurally different pointers
+  // (clist, fds) each time we do a continue on a loop, but can rely on
+  // identical offsets for both instead
   struct client *cl_arr = malloc(num_fds * sizeof(struct client)), *cl_ptr = cl_arr, *cl_tmp = NULL;
   while(clist) {
     memcpy(cl_ptr++, clist, sizeof(struct client));
