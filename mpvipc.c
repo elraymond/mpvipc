@@ -229,7 +229,7 @@ void clist_get_response(char* cmd, reqtype_t rtype) {
      fds_tmp->events = poll_write;
   }
 
-  // main polling loop - keep goind til we have seen 1 read/write each on all
+  // main polling loop - keep going til we have seen 1 read/write each on all
   // fd's
   while(num_finished < num_fds) {
 

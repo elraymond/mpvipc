@@ -4,9 +4,9 @@ mpvipc
 mpvipc - send IPC commands to one mpv instance or multiple of them (on Linux)
 
 Usage examples:
-mpvipc -v '{ "command": ["get_property", "track-list"] }'
-mpvipc '{ "command": ["cycle-values", "osd-level", "2", "3", "1"] }'
-mpvipc 'show-text ${media-title} 10000'
+ mpvipc -v '{ "command": ["get_property", "track-list"] }'
+ mpvipc '{ "command": ["cycle-values", "osd-level", "2", "3", "1"] }'
+ mpvipc 'show-text ${media-title} 10000'
 
 This assumes a well defined directory where the sockets of all running mpv
 instances can be found. The default value is $HOME/.config/mpv/socket but it
@@ -14,32 +14,47 @@ can be modified by command line option. Myself, I always run mpv through a
 script wrapper to ensure consistent behavior.
 
 Another example, lua code:
-function on_mute_change(name, value)
-if value == false then
-  local socket = mp.get_property('input-ipc-server')
-  local cmd = [[{ "command": ["set_property", "mute", true] }]]
-  if socket ~= '' then
-    os.execute(("mpvipc -e %s %q"):format(socket, cmd))
-  end
-end
-end
-mp.observe_property("mute", "bool", on_mute_change)
+ function on_mute_change(name, value)
+   if value == false then
+     local socket = mp.get_property('input-ipc-server')
+     local cmd = [[{ "command": ["set_property", "mute", true] }]]
+     if socket ~= '' then
+       os.execute(("mpvipc -e %s %q"):format(socket, cmd))
+     end
+   end
+ end
+ mp.observe_property("mute", "bool", on_mute_change)
 
 This way, each time an instance is un-muted all other instances are muted.
 Obviously useful when you don't appreciate multiple instances babbling at the
 same time.
 
 Other usage examples are mpv key bindings that control all running mpv
-instances at the same time. Like an Alt+q binding to quit them all. Or at-jobs
-to start/stop recordings.
+instances. Like an Alt+q binding to quit them all. Or at-jobs to start/stop
+recordings.
 
 Options:
--v verbose - the program is written to produce zero output per default
--d debug   - extra diagnostics regarding IPC communication and socket polling
--e exclude - exclude this socket from operation; basename or full path
--i include - the opposite; operate on this socket only; basename or full path
--p path    - path to socket directory; absolute or relative to HOME
+ -v verbose - the program is written to produce zero output per default
+ -d debug   - extra diagnostics regarding IPC communication and socket polling
+ -e exclude - exclude this socket from operation; basename or full path
+ -i include - the opposite; operate on this socket only; basename or full path
+ -p path    - path to socket directory; absolute or relative to HOME
 
 Compile like this:
-clang mpvipc.c -o mpvipc
+ clang mpvipc.c -o mpvipc
 or with gdb if you like, same options.
+
+Then start all your mpv instances with script code like this:
+ home=$HOME
+ mpv=/usr/bin/mpv
+ socket_dir=$home/.config/mpv/socket
+ socket=${socket_dir}/$$
+ exec $mpv --input-ipc-server="$socket" "$@"
+and make sure socket_dir exists. This way, each instance has an IPC socket in
+that directory with name equal to its PID (that's why we need the exec). Which
+makes it easier to identify individual instances programmatically, like by doing
+grep's on command line options of 'ps' output.
+
+The program unlinks sockets where it gets a "connection refused" by the way. So
+if you actually use it regularly there's no need to otherwise clean up the
+socket directory.
