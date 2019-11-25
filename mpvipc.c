@@ -202,8 +202,13 @@ void clist_get_response(char* cmd, reqtype_t rtype) {
   short events;
   unsigned short poll_read = POLLIN, poll_write = POLLOUT;
   unsigned short poll_all = POLLIN | POLLPRI | POLLOUT
-    | POLLRDNORM | POLLRDBAND 
-    | POLLMSG | POLLREMOVE | POLLRDHUP;
+#if defined __USE_XOPEN || defined __USE_XOPEN2K8
+    | POLLRDNORM | POLLRDBAND
+#endif
+#ifdef __USE_GNU
+    | POLLMSG | POLLREMOVE | POLLRDHUP
+#endif
+    ;
   char buf[BUFSIZE+1];
   struct client *cl = clist;
 
@@ -255,16 +260,21 @@ void clist_get_response(char* cmd, reqtype_t rtype) {
 
       events = fds_tmp->revents;
       if(events != 0)
-        debug("fd %2d revents :%d %d %d %d %d %d %d %d\n",
-              fd,
-              bit(events, POLLIN),
-              bit(events, POLLPRI),
-              bit(events, POLLOUT),
-              bit(events, POLLRDNORM),
-              bit(events, POLLRDBAND),
-              bit(events, POLLMSG),
-              bit(events, POLLREMOVE),
-              bit(events, POLLRDHUP));
+        debug("fd %2d revents :%d %d %d %d %d %d %d %d\n"
+              ,fd
+              ,bit(events, POLLIN)
+              ,bit(events, POLLPRI)
+              ,bit(events, POLLOUT)
+#if defined __USE_XOPEN || defined __USE_XOPEN2K8
+              ,bit(events, POLLRDNORM)
+              ,bit(events, POLLRDBAND)
+#endif
+#ifdef __USE_GNU
+              ,bit(events, POLLMSG)
+              ,bit(events, POLLREMOVE)
+              ,bit(events, POLLRDHUP)
+#endif
+              );
 
       // check if writable
       if (fds_tmp->revents & poll_write) {
