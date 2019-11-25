@@ -268,11 +268,18 @@ void clist_get_response(char* cmd, reqtype_t rtype) {
 #if defined __USE_XOPEN || defined __USE_XOPEN2K8
               ,bit(events, POLLRDNORM)
               ,bit(events, POLLRDBAND)
+#else
+              ,0
+              ,0
 #endif
 #ifdef __USE_GNU
               ,bit(events, POLLMSG)
               ,bit(events, POLLREMOVE)
               ,bit(events, POLLRDHUP)
+#else
+              ,0
+              ,0
+              ,0
 #endif
               );
 
